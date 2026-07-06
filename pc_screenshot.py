@@ -30,7 +30,7 @@ T = {
     "zh": {
         "title": "PC 截图工具",
         "subtitle": "多功能屏幕截图",
-        "output_dir": "输出目录",
+        "output_dir": "输出目录:",
         "btn_full": "全屏截图",
         "btn_region": "区域截图",
         "btn_stealth": "隐身模式 (反作弊)",
@@ -73,7 +73,7 @@ T = {
     "en": {
         "title": "PC Screenshot Tool",
         "subtitle": "Multi-mode capture utility",
-        "output_dir": "Output",
+        "output_dir": "Output:",
         "btn_full": "Full Screen",
         "btn_region": "Region Select",
         "btn_stealth": "Stealth Mode (Anti-Cheat)",
@@ -465,24 +465,39 @@ def run_gui():
     style.configure("Status.TLabel", foreground="#888")
 
     out_dir = tk.StringVar(value=get_desktop_path())
-    status_var = tk.StringVar(value=_("ready"))
+    status_var = tk.StringVar()
+
+    # ---- Registry: all widgets that need re-translation on lang switch ----
+    _widgets = []  # list of (widget, method, key)  method="text"|"configure"
+
+    def _add(widget, method, key):
+        _widgets.append((widget, method, key))
 
     # Header
-    ttk.Label(root, text=_("title"), style="Header.TLabel").pack(pady=(20, 5))
-    ttk.Label(root, text=_("subtitle"), style="Status.TLabel").pack()
+    lbl_title = ttk.Label(root, style="Header.TLabel")
+    lbl_title.pack(pady=(20, 5)); _add(lbl_title, "text", "title")
+    lbl_sub = ttk.Label(root, style="Status.TLabel")
+    lbl_sub.pack(); _add(lbl_sub, "text", "subtitle")
 
     # Language selector
     lang_frame = tk.Frame(root, bg="#2b2b2b")
     lang_frame.pack(pady=(5, 5))
     lang_var = tk.StringVar(value=_current_lang)
 
+    def refresh_ui():
+        """Re-apply all translations to registered widgets."""
+        root.title(_("title"))
+        for w, method, key in _widgets:
+            try:
+                w.configure(text=_(key))
+            except Exception:
+                pass
+        status_var.set(_("ready"))
+
     def switch_lang():
         new_lang = lang_var.get()
         if set_lang(new_lang):
-            root.title(_("title"))
-            # Rebuild GUI — simpler: just show msg and ask restart
-            msg = _("lang_switched", lang_name=_("lang_zh") if new_lang == "zh" else _("lang_en"))
-            status_var.set(msg)
+            refresh_ui()
 
     tk.Radiobutton(lang_frame, text="中文", variable=lang_var, value="zh",
                    command=switch_lang, bg="#2b2b2b", fg="white", selectcolor="#2b2b2b",
@@ -491,13 +506,14 @@ def run_gui():
                    command=switch_lang, bg="#2b2b2b", fg="white", selectcolor="#2b2b2b",
                    activebackground="#2b2b2b", activeforeground="white").pack(side=tk.LEFT, padx=5)
 
-    # Separator
     ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=5)
 
     # Output dir
     dir_frame = tk.Frame(root, bg="#2b2b2b")
     dir_frame.pack(fill=tk.X, padx=20, pady=(5, 5))
-    ttk.Label(dir_frame, text=_("output_dir") + ":").pack(side=tk.LEFT)
+    lbl_outdir = ttk.Label(dir_frame)
+    lbl_outdir.pack(side=tk.LEFT); _add(lbl_outdir, "text", "output_dir")
+    # append ":" manually since it's not part of the key
     dir_entry = tk.Entry(dir_frame, textvariable=out_dir, bg="#3c3c3c", fg="white",
                          insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
     dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
@@ -505,7 +521,6 @@ def run_gui():
                command=lambda: out_dir.set(filedialog.askdirectory(initialdir=out_dir.get()) or out_dir.get())
                ).pack(side=tk.RIGHT)
 
-    # Separator
     ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=10)
 
     # Capture buttons
@@ -566,27 +581,28 @@ def run_gui():
         threading.Thread(target=_run, daemon=True).start()
 
     btn_configs = [
-        (_("btn_full"),    "full",    "#4a90d9"),
-        (_("btn_region"),  "region",  "#50b86c"),
-        (_("btn_stealth"), "stealth", "#e8853b"),
-        (_("btn_clip"),    "clip",    "#9b59b6"),
+        ("btn_full",    "full",    "#4a90d9"),
+        ("btn_region",  "region",  "#50b86c"),
+        ("btn_stealth", "stealth", "#e8853b"),
+        ("btn_clip",    "clip",    "#9b59b6"),
     ]
 
-    for label, mode, color in btn_configs:
-        btn = tk.Button(btn_frame, text=label, command=lambda m=mode: do_capture(m),
+    for key, mode, color in btn_configs:
+        btn = tk.Button(btn_frame, command=lambda m=mode: do_capture(m),
                         bg=color, fg="white", font=("Segoe UI", 11, "bold"),
                         relief=tk.FLAT, padx=12, pady=8, cursor="hand2",
                         activebackground=color, activeforeground="white")
         btn.pack(fill=tk.X, pady=4, ipady=2)
+        _add(btn, "text", key)
 
-    # Separator
     ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=10)
 
-    # Timer
+    # Timer section
     auto_frame = tk.Frame(root, bg="#2b2b2b")
     auto_frame.pack(fill=tk.X, padx=20, pady=5)
 
-    ttk.Label(auto_frame, text=_("timed_label") + ":").pack(side=tk.LEFT)
+    lbl_timed = ttk.Label(auto_frame)
+    lbl_timed.pack(side=tk.LEFT); _add(lbl_timed, "text", "timed_label")
     interval_var = tk.StringVar(value="")
     tk.Entry(auto_frame, textvariable=interval_var, width=5, bg="#3c3c3c", fg="white",
              insertbackground="white", relief=tk.FLAT, font=("Consolas", 11)).pack(side=tk.LEFT, padx=5)
@@ -616,7 +632,8 @@ def run_gui():
         t.start()
         interval_var.set("")
 
-    ttk.Button(auto_frame, text=_("btn_start"), command=start_interval).pack(side=tk.LEFT, padx=5)
+    btn_start = ttk.Button(auto_frame, command=start_interval)
+    btn_start.pack(side=tk.LEFT, padx=5); _add(btn_start, "text", "btn_start")
 
     def stop_interval():
         for t in threading.enumerate():
@@ -624,9 +641,10 @@ def run_gui():
                 t._interval_running = False
         status_var.set(_("interval_stopped"))
 
-    ttk.Button(auto_frame, text=_("btn_stop"), command=stop_interval).pack(side=tk.LEFT)
+    btn_stop = ttk.Button(auto_frame, command=stop_interval)
+    btn_stop.pack(side=tk.LEFT); _add(btn_stop, "text", "btn_stop")
 
-    # Hotkey
+    # Hotkey toggle
     hotkey_var = tk.BooleanVar(value=False)
 
     def toggle_hotkey():
@@ -639,20 +657,22 @@ def run_gui():
 
     hotkey_frame = tk.Frame(root, bg="#2b2b2b")
     hotkey_frame.pack(fill=tk.X, padx=20, pady=5)
-    ttk.Checkbutton(hotkey_frame, text=_("hotkey_toggle"),
-                    variable=hotkey_var, command=toggle_hotkey).pack(side=tk.LEFT)
+    chk_hotkey = ttk.Checkbutton(hotkey_frame, variable=hotkey_var, command=toggle_hotkey)
+    chk_hotkey.pack(side=tk.LEFT); _add(chk_hotkey, "configure", "hotkey_toggle")
 
     listener = HotkeyListener()
 
-    # Separator
     ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=(10, 5))
 
     # Status
     ttk.Label(root, textvariable=status_var, style="Status.TLabel").pack(pady=(0, 10))
 
     # Open folder
-    ttk.Button(root, text=_("btn_open_folder"),
-               command=lambda: open_folder(out_dir.get())).pack(pady=(0, 15))
+    btn_folder = ttk.Button(root, command=lambda: open_folder(out_dir.get()))
+    btn_folder.pack(pady=(0, 15)); _add(btn_folder, "text", "btn_open_folder")
+
+    # Initial translation
+    refresh_ui()
 
     root.protocol("WM_DELETE_WINDOW", lambda: (listener.stop(), root.destroy()))
     root.mainloop()
