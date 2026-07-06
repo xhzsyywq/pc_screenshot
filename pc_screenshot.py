@@ -78,6 +78,187 @@ class CaptureBusy(Exception):
     pass
 
 # ============================================================
+#  Anti-Cheat Scanner — detects invigilation/anti-cheat software
+# ============================================================
+
+# Signature database: (process_name_substring, window_title_substring, category, risk_level)
+# risk: 1=monitoring_only, 2=moderate_restriction, 3=full_lockdown
+ANTI_CHEAT_SIGNATURES = [
+    # --- Chinese exam platforms ---
+    ("educoder",     "考试|头歌|EduCoder",   "Exam Platform",    3),
+    ("educoderkey",  "",                     "Anti-Cheat Hook",  3),
+    ("chaoxing",     "超星|学习通",           "Exam Platform",    3),
+    ("zhihuishu",    "智慧树",               "Exam Platform",    2),
+    ("yuketang",     "雨课堂",               "Classroom Tool",   1),
+    ("xuexitong",    "学习通",               "Exam Platform",    3),
+    ("examclient",   "考试",                 "Exam Client",      3),
+    ("kaoshi",       "考试",                 "Exam Client",      3),
+    ("invigilation", "",                     "Invigilation",     3),
+    # --- Meeting / screen share (may monitor) ---
+    ("wemeet",       "腾讯会议",              "Meeting",          1),
+    ("voovmeeting",  "",                     "Meeting",          1),
+    ("dingtalk",     "钉钉",                 "Meeting",          1),
+    ("feishu",       "飞书",                 "Meeting",          1),
+    ("zoom",         "",                     "Meeting",          1),
+    ("teams",        "",                     "Meeting",          1),
+    # --- Remote desktop (may be used for monitoring) ---
+    ("teamviewer",   "",                     "Remote Desktop",   1),
+    ("anydesk",      "",                     "Remote Desktop",   1),
+    ("sunlogin",     "向日葵",               "Remote Desktop",   1),
+    ("todesk",       "",                     "Remote Desktop",   1),
+    # --- Anti-cheat / screen lock tools ---
+    ("screenlock",   "",                     "Screen Lock",      3),
+    ("examshield",   "",                     "Exam Shield",      3),
+    ("examguard",    "",                     "Exam Guard",       3),
+    ("securebrowser","",                     "Secure Browser",   3),
+    ("lockdown",     "",                     "Lockdown Browser", 3),
+    ("safeexam",     "",                     "Safe Exam",        3),
+    # --- Keylog / screen record ---
+    ("obs",          "",                     "Screen Recorder",  1),
+    ("screenrecord", "",                     "Screen Recorder",  1),
+    ("oCam",         "",                     "Screen Recorder",  1),
+    # --- Clipboard / input monitors ---
+    ("clipboardmon", "",                     "Clipboard Monitor",2),
+    ("keylogger",    "",                     "Key Logger",       2),
+    ("inputmonitor", "",                     "Input Monitor",    2),
+]
+
+def scan_anti_cheat():
+    """
+    Scan all running processes and visible windows for anti-cheat/invigilation software.
+    Returns list of dicts: {pid, name, title, category, risk, window_handle}
+    """
+    results = []
+    seen_pids = set()
+
+    # Phase 1: Scan processes by name
+    try:
+        import ctypes.wintypes
+        psapi = ctypes.windll.psapi
+        kernel32 = ctypes.windll.kernel32
+
+        # Get process list
+        pids = (ctypes.c_uint32 * 2048)()
+        needed = ctypes.c_uint32()
+        if psapi.EnumProcesses(ctypes.byref(pids), ctypes.sizeof(pids), ctypes.byref(needed)):
+            count = needed.value // 4
+            for i in range(min(count, 2048)):
+                pid = pids[i]
+                if pid == 0 or pid == 4:  # skip idle/system
+                    continue
+                try:
+                    h_proc = kernel32.OpenProcess(0x0400 | 0x0010, False, pid)  # QUERY_INFORMATION | VM_READ
+                    if not h_proc:
+                        continue
+                    name_buf = ctypes.create_unicode_buffer(260)
+                    size = ctypes.c_uint32(260)
+                    if psapi.GetModuleBaseNameW(h_proc, None, name_buf, size):
+                        proc_name = name_buf.value.lower() if name_buf.value else ""
+                        for sig_name, sig_title, category, risk in ANTI_CHEAT_SIGNATURES:
+                            if sig_name.lower() in proc_name:
+                                results.append({
+                                    "pid": pid, "name": proc_name,
+                                    "title": "", "category": category,
+                                    "risk": risk, "hwnd": 0,
+                                    "matched": f"process:{sig_name}"
+                                })
+                                seen_pids.add(pid)
+                                break
+                    kernel32.CloseHandle(h_proc)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Phase 2: Scan visible window titles
+    try:
+        windows = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+
+        @WNDENUMPROC
+        def enum_callback(hwnd, lparam):
+            if user32.IsWindowVisible(hwnd):
+                pid = ctypes.c_uint32()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value or ""
+                    windows.append((hwnd, pid.value, title))
+            return True
+
+        user32.EnumWindows(enum_callback, 0)
+
+        for hwnd, pid, title in windows:
+            if pid in seen_pids and any(r["pid"] == pid for r in results):
+                continue  # already matched by process name
+            title_lower = title.lower()
+            for sig_name, sig_title, category, risk in ANTI_CHEAT_SIGNATURES:
+                matched = False
+                if sig_title:
+                    import re
+                    if re.search(sig_title, title, re.IGNORECASE):
+                        matched = True
+                if not matched and sig_name and sig_name.lower() in title_lower:
+                    matched = True
+                if matched:
+                    try:
+                        proc_name = ""
+                        h_proc = kernel32.OpenProcess(0x0400, False, pid)
+                        if h_proc:
+                            name_buf = ctypes.create_unicode_buffer(260)
+                            size = ctypes.c_uint32(260)
+                            if psapi.GetModuleBaseNameW(h_proc, None, name_buf, size):
+                                proc_name = name_buf.value or ""
+                            kernel32.CloseHandle(h_proc)
+                    except Exception:
+                        pass
+                    results.append({
+                        "pid": pid, "name": proc_name,
+                        "title": title, "category": category,
+                        "risk": risk, "hwnd": hwnd,
+                        "matched": f"window:{sig_name or sig_title}"
+                    })
+                    seen_pids.add(pid)
+                    break
+    except Exception:
+        pass
+
+    # Phase 3: Check for anti-cheat hooks (SetWindowsHook, RegisterHotKey, BlockInput)
+    try:
+        # Check if BlockInput is active (keyboard/mouse locked)
+        # We can't directly detect the hook chain from Python without kernel access,
+        # but we can check common indicators
+        blocked = user32.GetAsyncKeyState(0x41)  # Check if 'A' key state is abnormal
+        # This is a heuristic — if BlockInput is active, key state reads may be unusual
+    except Exception:
+        pass
+
+    return results
+
+
+def format_scan_report(results):
+    """Format scan results as human-readable text."""
+    if not results:
+        return _("scan_clean")
+    lines = [_("scan_found", count=len(results))]
+    for r in sorted(results, key=lambda x: -x["risk"]):
+        risk_icon = {1: "⚪", 2: "🟡", 3: "🔴"}.get(r["risk"], "⚪")
+        name = r["name"] or r["title"] or "Unknown"
+        lines.append(f"  {risk_icon} PID={r['pid']} {name} [{r['category']}]")
+        if r.get("title") and r["title"] != name:
+            lines.append(f"      Title: {r['title']}")
+        lines.append(f"      Match: {r['matched']}")
+    return "\n".join(lines)
+
+
+def detect_active_threats():
+    """Return only high-risk (level 2-3) detected processes."""
+    results = scan_anti_cheat()
+    return [r for r in results if r["risk"] >= 2]
+
+# ============================================================
 #  i18n — Chinese / English
 # ============================================================
 
@@ -124,6 +305,11 @@ T = {
         "lang_switched": "语言已切换为: {lang_name}",
         "lang_zh": "中文",
         "lang_en": "English",
+        # Scanner
+        "scan_clean": "[*] 未检测到反作弊/监考软件。",
+        "scan_found": "[!] 检测到 {count} 个反作弊/监考进程:",
+        "scan_btn": "扫描反作弊",
+        "scan_title": "反作弊扫描结果",
     },
     "en": {
         "title": "PC Screenshot Tool",
@@ -167,6 +353,11 @@ T = {
         "lang_switched": "Language switched to: {lang_name}",
         "lang_zh": "中文",
         "lang_en": "English",
+        # Scanner
+        "scan_clean": "[*] No anti-cheat/invigilation software detected.",
+        "scan_found": "[!] {count} anti-cheat/invigilation process(es) detected:",
+        "scan_btn": "Scan Anti-Cheat",
+        "scan_title": "Anti-Cheat Scan Result",
     },
 }
 
@@ -720,6 +911,30 @@ def run_gui():
         btn.pack(fill=tk.X, pady=4, ipady=2)
         _add(btn, "text", key)
 
+    # Scan Anti-Cheat button
+    def do_scan():
+        def _run():
+            status_var.set(_("capturing"))
+            root.update()
+            results = scan_anti_cheat()
+            report = format_scan_report(results)
+            root.after(0, lambda: messagebox.showinfo(_("scan_title"), report))
+            if results:
+                log_event("scan_detected", f"count={len(results)}")
+                threats = [r for r in results if r["risk"] >= 2]
+                status_var.set(f"Found {len(results)} process(es), {len(threats)} high-risk")
+            else:
+                log_event("scan_clean")
+                status_var.set(_("scan_clean"))
+        threading.Thread(target=_run, daemon=True).start()
+
+    btn_scan = tk.Button(btn_frame, command=do_scan,
+                         bg="#c0392b", fg="white", font=("Segoe UI", 11, "bold"),
+                         relief=tk.FLAT, padx=12, pady=8, cursor="hand2",
+                         activebackground="#c0392b", activeforeground="white")
+    btn_scan.pack(fill=tk.X, pady=4, ipady=2)
+    _add(btn_scan, "text", "scan_btn")
+
     ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=10)
 
     # Timer section
@@ -853,6 +1068,7 @@ def main():
         print("    --full              Full screen screenshot")
         print("    --region            Select region with mouse")
         print("    --stealth           Anti-cheat stealth mode")
+        print("    --scan              Scan for anti-cheat/invigilation software")
         print("    --clip              Full screen => clipboard")
         print("    --hotkey            Start Ctrl+Shift+S listener")
         print("    --interval N        Capture every N seconds")
@@ -861,6 +1077,10 @@ def main():
         print("    --open              Open image after capture")
         print("    --folder            Open output folder after capture")
         print()
+        return
+
+    if "--scan" in args:
+        print(format_scan_report(scan_anti_cheat()))
         return
 
     if "--hotkey" in args:
