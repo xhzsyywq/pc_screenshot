@@ -20,7 +20,62 @@ import subprocess
 import time
 import struct
 import threading
+import json
+import logging
 from datetime import datetime
+
+# ============================================================
+#  Config & Logging
+# ============================================================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "pc_screenshot_config.json")
+LOG_FILE = os.path.join(SCRIPT_DIR, "pc_screenshot.log")
+
+def load_config():
+    """Load config from JSON, fall back to defaults."""
+    defaults = {
+        "output_dir": os.path.join(os.path.expanduser("~"), "Desktop"),
+        "log_enabled": True,
+        "log_max_lines": 5000,
+        "hotkey_enabled": True,
+        "hotkey_require_admin": False,
+        "stealth_ps1": os.path.join(SCRIPT_DIR, "educoder_screenshot_enable.ps1"),
+        "stealth_dll": os.path.join(SCRIPT_DIR, "StealthCapture.dll"),
+    }
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            defaults.update(loaded)
+    except Exception:
+        pass
+    return defaults
+
+CONFIG = load_config()
+
+_log_lines = []
+_log_lock = threading.Lock()
+
+def log_event(action, detail=""):
+    """Thread-safe event logger. Writes to memory and file."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {action}" + (f" | {detail}" if detail else "")
+    with _log_lock:
+        _log_lines.append(line)
+        if len(_log_lines) > CONFIG.get("log_max_lines", 5000):
+            _log_lines.pop(0)
+        if CONFIG.get("log_enabled", True):
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+_capture_lock = threading.Lock()
+
+class CaptureBusy(Exception):
+    pass
 
 # ============================================================
 #  i18n — Chinese / English
@@ -117,6 +172,8 @@ T = {
 
 _current_lang = "zh"
 
+log_event("session_start", f"pid={os.getpid()}")
+
 def _(key, **fmt):
     """Translate key, optionally format with kwargs."""
     s = T.get(_current_lang, T["en"]).get(key, T["en"].get(key, key))
@@ -178,62 +235,72 @@ class BITMAPINFO(ctypes.Structure):
 
 def capture_fullscreen():
     """Capture entire virtual screen (all monitors). Returns (width, height, bytes_bgra)."""
-    x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-    y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-    w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-    h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    if not _capture_lock.acquire(blocking=False):
+        raise CaptureBusy("Another capture is in progress")
+    try:
+        x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
 
-    hdc_screen = user32.GetDC(0)
-    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-    hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-    gdi32.SelectObject(hdc_mem, hbmp)
-    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, SRCCOPY)
+        hdc_screen = user32.GetDC(0)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        gdi32.SelectObject(hdc_mem, hbmp)
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, SRCCOPY)
 
-    bi = BITMAPINFO()
-    bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bi.bmiHeader.biWidth = w
-    bi.bmiHeader.biHeight = -h
-    bi.bmiHeader.biPlanes = 1
-    bi.bmiHeader.biBitCount = 32
-    bi.bmiHeader.biCompression = 0
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = w
+        bi.bmiHeader.biHeight = -h
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0
 
-    buf = ctypes.create_string_buffer(w * h * 4)
-    gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
 
-    gdi32.DeleteObject(hbmp)
-    gdi32.DeleteDC(hdc_mem)
-    user32.ReleaseDC(0, hdc_screen)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
 
-    return w, h, buf.raw
+        return w, h, buf.raw
+    finally:
+        _capture_lock.release()
 
 
 def capture_region(left, top, width, height):
     """Capture a specific screen region."""
-    w = max(1, width)
-    h = max(1, height)
+    if not _capture_lock.acquire(blocking=False):
+        raise CaptureBusy("Another capture is in progress")
+    try:
+        w = max(1, width)
+        h = max(1, height)
 
-    hdc_screen = user32.GetDC(0)
-    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-    hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-    gdi32.SelectObject(hdc_mem, hbmp)
-    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, left, top, SRCCOPY)
+        hdc_screen = user32.GetDC(0)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        gdi32.SelectObject(hdc_mem, hbmp)
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, left, top, SRCCOPY)
 
-    bi = BITMAPINFO()
-    bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bi.bmiHeader.biWidth = w
-    bi.bmiHeader.biHeight = -h
-    bi.bmiHeader.biPlanes = 1
-    bi.bmiHeader.biBitCount = 32
-    bi.bmiHeader.biCompression = 0
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = w
+        bi.bmiHeader.biHeight = -h
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0
 
-    buf = ctypes.create_string_buffer(w * h * 4)
-    gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
 
-    gdi32.DeleteObject(hbmp)
-    gdi32.DeleteDC(hdc_mem)
-    user32.ReleaseDC(0, hdc_screen)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
 
-    return w, h, buf.raw
+        return w, h, buf.raw
+    finally:
+        _capture_lock.release()
 
 
 # ============================================================
@@ -280,15 +347,46 @@ def save_screenshot(w, h, raw_bgra, filepath):
 
 
 # ============================================================
+#  Window title detection (for filename context)
+# ============================================================
+
+def get_foreground_window_title():
+    """Get title of the foreground window. Returns '' on failure."""
+    try:
+        hwnd = user32.GetForegroundWindow()
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value or ""
+        # Sanitize for filename
+        bad = '<>:"/\\|?*'
+        for ch in bad:
+            title = title.replace(ch, "_")
+        return title[:40].strip()
+    except Exception:
+        return ""
+
+
+# ============================================================
 #  Output helpers
 # ============================================================
 
 def get_filename(prefix="screenshot"):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{prefix}_{ts}.png"
+    win = get_foreground_window_title()
+    parts = [prefix]
+    if win:
+        parts.append(win)
+    parts.append(ts)
+    return "_".join(parts) + ".png"
 
 
-def get_desktop_path():
+def get_output_dir():
+    d = CONFIG.get("output_dir", "")
+    if d and os.path.isdir(d):
+        return d
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
@@ -304,37 +402,54 @@ def open_folder(path):
 #  Stealth mode
 # ============================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STEALTH_PS1 = os.path.join(SCRIPT_DIR, "educoder_screenshot_enable.ps1")
-
-
 def capture_stealth():
-    if not os.path.exists(STEALTH_PS1):
-        return None, f"Stealth script not found: {STEALTH_PS1}"
+    """Call the stealth PowerShell screenshot script. Uses config paths."""
+    ps1 = CONFIG.get("stealth_ps1", "")
+    if not ps1 or not os.path.exists(ps1):
+        # Try default locations
+        candidates = [
+            os.path.join(SCRIPT_DIR, "educoder_screenshot_enable.ps1"),
+            os.path.join(SCRIPT_DIR, "..", "educoder_screenshot_enable.ps1"),
+        ]
+        ps1 = None
+        for c in candidates:
+            if os.path.exists(c):
+                ps1 = c
+                break
+        if not ps1:
+            log_event("stealth_failed", "ps1_not_found")
+            return None, "Stealth script not found. Check config or place educoder_screenshot_enable.ps1 in script directory."
 
     try:
         result = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", STEALTH_PS1],
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", ps1],
             capture_output=True, text=True, timeout=30,
-            cwd=SCRIPT_DIR
+            cwd=os.path.dirname(ps1)
         )
         for line in result.stdout.splitlines():
             line = line.strip()
             if line.startswith("Saved:") or line.startswith("File:"):
                 path = line.split(":", 1)[1].strip()
                 if os.path.exists(path):
+                    log_event("stealth_ok", path)
                     return path, None
+        dir_ = os.path.dirname(ps1)
         pngs = sorted(
-            [f for f in os.listdir(SCRIPT_DIR) if f.startswith("screenshot_") and f.endswith(".png")],
-            key=lambda f: os.path.getmtime(os.path.join(SCRIPT_DIR, f)),
+            [f for f in os.listdir(dir_) if f.startswith("screenshot_") and f.endswith(".png")],
+            key=lambda f: os.path.getmtime(os.path.join(dir_, f)),
             reverse=True
         )
         if pngs:
-            return os.path.join(SCRIPT_DIR, pngs[0]), None
+            fp = os.path.join(dir_, pngs[0])
+            log_event("stealth_ok", fp)
+            return fp, None
+        log_event("stealth_failed", "no_output")
         return None, result.stderr or "No output found"
     except subprocess.TimeoutExpired:
+        log_event("stealth_failed", "timeout")
         return None, "Stealth PowerShell script timed out"
     except Exception as e:
+        log_event("stealth_failed", str(e))
         return None, str(e)
 
 
@@ -464,7 +579,7 @@ def run_gui():
     style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"))
     style.configure("Status.TLabel", foreground="#888")
 
-    out_dir = tk.StringVar(value=get_desktop_path())
+    out_dir = tk.StringVar(value=CONFIG.get("output_dir", get_output_dir()))
     status_var = tk.StringVar()
 
     # ---- Registry: all widgets that need re-translation on lang switch ----
@@ -538,45 +653,55 @@ def run_gui():
             root.update()
 
             result = None
-            if mode == "full":
-                w, h, raw = capture_fullscreen()
-                fp = os.path.join(out, get_filename(_("file_prefix_full")))
-                save_screenshot(w, h, raw, fp)
-                result = fp
-            elif mode == "region":
-                root.withdraw()
-                time.sleep(0.3)
-                sel = RegionSelector().select()
-                root.deiconify()
-                if sel is None:
-                    status_var.set(_("region_cancelled"))
-                    return
-                x, y, rw, rh = sel
-                if rw < 5 or rh < 5:
-                    status_var.set(_("region_too_small"))
-                    return
-                w, h, raw = capture_region(x, y, rw, rh)
-                fp = os.path.join(out, get_filename(_("file_prefix_region")))
-                save_screenshot(w, h, raw, fp)
-                result = fp
-            elif mode == "stealth":
-                result, err = capture_stealth()
-                if err:
-                    root.after(0, lambda: messagebox.showerror(_("err_title"), err))
-                    status_var.set(_("stealth_failed"))
-                    return
-            elif mode == "clip":
-                w, h, raw = capture_fullscreen()
-                fp = os.path.join(out, get_filename(_("file_prefix_clip")))
-                save_screenshot(w, h, raw, fp)
-                copy_to_clipboard_image(fp)
-                result = fp
+            try:
+                if mode == "full":
+                    w, h, raw = capture_fullscreen()
+                    fp = os.path.join(out, get_filename(_("file_prefix_full")))
+                    save_screenshot(w, h, raw, fp)
+                    result = fp
+                    log_event("capture_full", fp)
+                elif mode == "region":
+                    root.withdraw()
+                    time.sleep(0.3)
+                    sel = RegionSelector().select()
+                    root.deiconify()
+                    if sel is None:
+                        status_var.set(_("region_cancelled"))
+                        return
+                    x, y, rw, rh = sel
+                    if rw < 5 or rh < 5:
+                        status_var.set(_("region_too_small"))
+                        return
+                    w, h, raw = capture_region(x, y, rw, rh)
+                    fp = os.path.join(out, get_filename(_("file_prefix_region")))
+                    save_screenshot(w, h, raw, fp)
+                    result = fp
+                    log_event("capture_region", fp)
+                elif mode == "stealth":
+                    result, err = capture_stealth()
+                    if err:
+                        root.after(0, lambda: messagebox.showerror(_("err_title"), err))
+                        status_var.set(_("stealth_failed"))
+                        return
+                elif mode == "clip":
+                    w, h, raw = capture_fullscreen()
+                    fp = os.path.join(out, get_filename(_("file_prefix_clip")))
+                    save_screenshot(w, h, raw, fp)
+                    copy_to_clipboard_image(fp)
+                    result = fp
+                    log_event("capture_clip", fp)
 
-            if result:
-                status_var.set(f"{_('saved')}: {os.path.basename(result)}")
-                if mode != "clip":
-                    copy_to_clipboard_image(result)
-                    status_var.set(f"{_('saved_clip')}: {os.path.basename(result)}")
+                if result:
+                    status_var.set(f"{_('saved')}: {os.path.basename(result)}")
+                    if mode != "clip":
+                        copy_to_clipboard_image(result)
+                        status_var.set(f"{_('saved_clip')}: {os.path.basename(result)}")
+            except CaptureBusy:
+                status_var.set("Capture busy — please wait")
+                log_event("capture_busy")
+            except Exception as e:
+                log_event("capture_error", str(e))
+                status_var.set(f"Error: {str(e)[:60]}")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -709,7 +834,7 @@ def main():
             _current_lang = detect_lang()
     _AUTO_DETECTED = True
 
-    out_dir = get_desktop_path()
+    out_dir = CONFIG.get("output_dir", get_output_dir())
 
     if len(args) == 0:
         run_gui()
@@ -739,16 +864,32 @@ def main():
         return
 
     if "--hotkey" in args:
+        if CONFIG.get("hotkey_require_admin", False):
+            try:
+                is_admin = ctypes.windll.shell32.IsUserAnAdmin()
+                if not is_admin:
+                    print("ERROR: Hotkey mode requires Administrator (set in config).")
+                    return
+            except Exception:
+                pass
+        if not CONFIG.get("hotkey_enabled", True):
+            print("ERROR: Hotkey mode disabled in config.")
+            return
         print(_("hotkey_start"))
+        log_event("hotkey_start")
         listener = HotkeyListener()
         count = [0]
 
         def on_hotkey():
             count[0] += 1
-            w, h, raw = capture_fullscreen()
-            fp = os.path.join(out_dir, get_filename(_("file_prefix_hotkey") + f"_{count[0]:04d}"))
-            save_screenshot(w, h, raw, fp)
-            print(f"  [#{count[0]}] {fp}")
+            try:
+                w, h, raw = capture_fullscreen()
+                fp = os.path.join(out_dir, get_filename(_("file_prefix_hotkey") + f"_{count[0]:04d}"))
+                save_screenshot(w, h, raw, fp)
+                log_event("capture_hotkey", fp)
+                print(f"  [#{count[0]}] {fp}")
+            except CaptureBusy:
+                pass
 
         listener.start(on_hotkey)
         try:
@@ -767,16 +908,22 @@ def main():
             print(_("interval_usage"))
             return
         print(_("interval_start", sec=sec))
+        log_event("interval_start", f"interval={sec}s")
         count = 0
         try:
             while True:
-                w, h, raw = capture_fullscreen()
-                fp = os.path.join(out_dir, get_filename(_("file_prefix_interval") + f"_{count:04d}"))
-                save_screenshot(w, h, raw, fp)
-                print(f"  [#{count}] {fp}")
-                count += 1
+                try:
+                    w, h, raw = capture_fullscreen()
+                    fp = os.path.join(out_dir, get_filename(_("file_prefix_interval") + f"_{count:04d}"))
+                    save_screenshot(w, h, raw, fp)
+                    log_event("capture_interval", fp)
+                    print(f"  [#{count}] {fp}")
+                    count += 1
+                except CaptureBusy:
+                    pass
                 time.sleep(sec)
         except KeyboardInterrupt:
+            log_event("interval_stop", f"count={count}")
             print(_("interval_stop", count=count))
         return
 
@@ -804,11 +951,13 @@ def main():
         w, h, raw = capture_region(x, y, rw, rh)
         filepath = os.path.join(out_dir, get_filename(_("file_prefix_region")))
         save_screenshot(w, h, raw, filepath)
+        log_event("capture_region", filepath)
     else:
         w, h, raw = capture_fullscreen()
         prefix = _("file_prefix_clip") if "--clip" in args else _("file_prefix_full")
         filepath = os.path.join(out_dir, get_filename(prefix))
         save_screenshot(w, h, raw, filepath)
+        log_event("capture_full" if "--full" in args else "capture_clip", filepath)
 
     if filepath:
         print(f"{_('saved')}: {filepath}")
